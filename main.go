@@ -26,52 +26,70 @@ type Response struct {
     Validators  map[string]ValidatorResponse `json:"validators"`
 }
 
-// TODO: can we somehow pass info between validators so that eg. in the SMTP connect one I don't have to do a lookup again?
-// TODO: also the domain part of address doesn't have to be extracted twice but just in the regex test
-
 // email adresses not really able to be validated by regexes
 var emailRegexp *regexp.Regexp;
-func validateRegex(email string) ValidatorResponse {
-    if !emailRegexp.MatchString(email) {
+func validateRegex(email string) (ValidatorResponse, string) {
+    matches := emailRegexp.FindStringSubmatch(email)
+    if matches == nil {
         return ValidatorResponse{
             Valid : false,
             Reason : "Email not validated by regex",
-        }
+        }, ""
     }
     return ValidatorResponse{
         Valid : true,
-    }
+    }, matches[1]
 }
 
-func validateMX(email string) ValidatorResponse {
-    domain := strings.SplitAfter(email, "@")[1]
+func validateMX(domain string) (ValidatorResponse, []*net.MX) {
     mxs, err := net.LookupMX(domain)
     if err != nil {
         log.Print(err.Error())
         return ValidatorResponse{
             Valid : false,
             Reason : "MX Lookup failed",
-        }
+        }, nil
     }
     if len(mxs) == 0 {
         return ValidatorResponse{
             Valid : false,
             Reason : "No MX records for the domain",
+        }, nil
+    }
+    return ValidatorResponse{
+        Valid : true,
+    }, mxs
+}
+
+// TODO: we should somehow cache the result of this so as not to open connections every time
+func validateSMTPConnection(servers []*net.MX) ValidatorResponse {
+    errors := make([]string,0)
+    for _,s := range(servers) {
+        conn, err := net.Dial("tcp", net.JoinHostPort(s.Host, "smtp"))
+        if err == nil {
+            return ValidatorResponse{
+                Valid : true,
+            }
         }
+        conn.Close()
     }
     return ValidatorResponse{
-        Valid : true,
+        Valid : false,
+        Reason : strings.Join(errors, ","),
     }
 }
 
-// TODO
-func validateSMTPConnection(email string) ValidatorResponse {
-    return ValidatorResponse{
-        Valid : true,
+func writeResponse(w http.ResponseWriter, response Response) {
+    output, err := json.Marshal(response)
+    if err != nil {
+        http.Error(w, "Cannot format response: " + err.Error(), http.StatusInternalServerError)
+        return
     }
+
+    w.Header().Set("content-type", "application/json")
+    w.Write(output)
 }
 
-var allValidators map[string]func(string)ValidatorResponse
 func validateHandler(w http.ResponseWriter, r *http.Request) {
     var params RequestParams
     body, err := ioutil.ReadAll(r.Body)
@@ -95,32 +113,39 @@ func validateHandler(w http.ResponseWriter, r *http.Request) {
         Validators: make(map[string]ValidatorResponse),
     }
 
-    for i,v := range(allValidators) {
-        r := v(params.Email)
-        response.Valid = response.Valid && r.Valid
-        response.Validators[i] = r
-    }
-
-    output, err := json.Marshal(response)
-    if err != nil {
-        http.Error(w, "Cannot format response: " + err.Error(), http.StatusInternalServerError)
+    regexValidation, domain := validateRegex(params.Email)
+    response.Validators["regex"] = regexValidation
+    if ! regexValidation.Valid {
+        response.Valid = false
+        writeResponse(w, response)
         return
     }
 
-    w.Header().Set("content-type", "application/json")
-    w.Write(output)
+    mxValidation, servers := validateMX(domain)
+    response.Validators["mx"] = mxValidation
+    if ! mxValidation.Valid {
+        response.Valid = false
+        writeResponse(w, response)
+        return
+    }
+
+    connectValidation := validateSMTPConnection(servers)
+    response.Validators["smtp"] = connectValidation
+    if ! connectValidation.Valid {
+        response.Valid = false
+        writeResponse(w, response)
+        return
+    }
+
+    writeResponse(w, response)
 }
 
 func initializeLocalData() {
     var err error
-    emailRegexp, err = regexp.CompilePOSIX(`[a-zA-Z-]@[a-zA-Z]`) // just a '@' surrounded by something word-like
+    emailRegexp, err = regexp.CompilePOSIX(`[a-zA-Z-]@([a-zA-Z].*$)`) // just a '@' surrounded by something word-like
     if err != nil {
         log.Fatal("Cannot initialize emailRegexp", err)
     }
-    allValidators = make(map[string]func(string)ValidatorResponse)
-    allValidators["regex"] = validateRegex
-    allValidators["domain"] = validateMX
-    allValidators["smtp"] = validateSMTPConnection
 }
 
 func main() {
