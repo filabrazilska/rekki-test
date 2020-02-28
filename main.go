@@ -66,12 +66,12 @@ func validateSMTPConnection(servers []*net.MX) ValidatorResponse {
     errors := make([]string,0)
     for _,s := range(servers) {
         conn, err := net.Dial("tcp", net.JoinHostPort(s.Host, "smtp"))
+        defer conn.Close()
         if err == nil {
             return ValidatorResponse{
                 Valid : true,
             }
         }
-        conn.Close()
     }
     return ValidatorResponse{
         Valid : false,
